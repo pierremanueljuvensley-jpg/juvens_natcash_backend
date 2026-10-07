@@ -1,125 +1,260 @@
 # JuvensTopUp NatCash Backend v3
 
-Backend Node.js (Express, CommonJS) qui reçoit les SMS NatCash transférés par une application Android **SMS Forwarder**, retrouve le `wallet_topup` correspondant dans Supabase et crédite automatiquement le portefeuille du client.
+Backend Node.js (Express) ki resevwa SMS NatCash ki soti nan aplikasyon Android SMS Forwarder, verifye peman an, jwenn `wallet_topup` ki koresponn nan Supabase, epi kredite wallet kliyan an otomatikman.
 
-Ce backend fait **uniquement** : NatCash → SMS → Supabase `wallet_topups` → crédit du wallet.
+Backend sa a fè sèlman:
 
-## Architecture
+NatCash → SMS → Supabase `wallet_topups` → credit wallet
 
-```
-CLIENT → JuvensTopUp frontend → wallet_topup PENDING (Supabase)
-Client paie via NatCash → SMS reçu sur le téléphone Android
-→ SMS Forwarder → HTTPS POST /sms → ce backend
-→ analyse du SMS → recherche du wallet_topup → validations
-→ RPC Supabase credit_wallet_topup → wallet crédité, wallet_topup = paid
-```
+Supabase se sèl source of truth la.
 
-Supabase est la **seule source de vérité**. Aucune base locale, aucun fichier de stockage.
+Pa gen database lokal.
+Pa gen `sms_store.json`.
+Pa gen Firebase.
+Pa gen supplier API nan backend sa a.
 
-## Installation et démarrage local
+---
 
-Prérequis : Node.js 18+.
+## 1. Architecture
 
-```bash
+```text
+CLIENT
+  ↓
+JuvensTopUp Frontend
+  ↓
+wallet_topup = pending
+  ↓
+Client peye ak NatCash
+  ↓
+NatCash SMS rive sou telefòn Android
+  ↓
+SMS Forwarder
+  ↓ HTTPS POST
+JuvensTopUp NatCash Backend
+  ↓
+Parse SMS
+  ↓
+Verify amount + transaction reference
+  ↓
+Find pending wallet_topup
+  ↓
+Supabase RPC
+  ↓
+Wallet credited
+  ↓
+wallet_topup = paid
+2. Stack
+Node.js 18+
+Express
+Supabase PostgreSQL
+Supabase RPC
+SMS Forwarder Android
+Render
+3. Environment Variables
+Backend lan bezwen variables sa yo:
+PORT=3000
+SUPABASE_URL=https://wcgywmsbketjwfipcygj.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=REPLACE_WITH_SUPABASE_SERVICE_ROLE_KEY
+SMS_FORWARDER_SECRET=REPLACE_WITH_A_LONG_RANDOM_SECRET
+NATCASH_WINDOW_MINUTES=120
+Important
+SUPABASE_SERVICE_ROLE_KEY ak SMS_FORWARDER_SECRET se secrets.
+Pa mete yo nan frontend. Pa mete yo nan README ak valeur reyèl. Pa mete yo nan GitHub kòm valeur reyèl.
+Nan Render, mete valeur reyèl yo nan Environment Variables.
+4. Installation
+Clone repository a:
+git clone https://github.com/pierremanueljuvensley-jpg/juvens_natcash_backend.git
+cd juvens_natcash_backend
+Install dependencies:
 npm install
-cp .env.example .env      # puis remplir les vraies valeurs (ne jamais commiter .env)
-# Charger les variables puis démarrer :
-node --env-file=.env server.js     # Node 20.6+
-# ou : export $(grep -v '^#' .env | xargs) && npm start
-```
-
-`npm run dev` lance le serveur avec rechargement automatique (`node --watch`).
-
-## Variables d'environnement (Render)
-
-| Variable | Obligatoire | Description |
-|---|---|---|
-| `PORT` | non (3000) | Port d'écoute (Render le définit automatiquement) |
-| `SUPABASE_URL` | oui | `https://wcgywmsbketjwfipcygj.supabase.co` |
-| `SUPABASE_SERVICE_ROLE_KEY` | oui | Clé service role, **côté serveur uniquement** |
-| `SMS_FORWARDER_SECRET` | oui | Long secret aléatoire partagé avec SMS Forwarder |
-| `NATCASH_WINDOW_MINUTES` | non (120) | Fenêtre de recherche des topups pending |
-
-Variables optionnelles : `CUSTOMER_PHONE_COLUMN` (nom de la colonne téléphone de `customers`, défaut `phone`) et `CORS_ORIGINS` (liste d'origines autorisées séparées par des virgules ; vide par défaut = CORS fermé).
-
-Le serveur refuse de démarrer si une variable obligatoire manque. Aucun secret par défaut n'existe dans le code.
-
-Générer un secret : `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
-
-## Endpoints
-
-### `GET /health`
-Sans authentification.
-```json
-{ "ok": true, "service": "juvens-natcash-backend", "version": "3.0.0" }
-```
-
-### `POST /sms`
-Header obligatoire : `x-sms-forwarder-secret: <SMS_FORWARDER_SECRET>`
-
-Corps JSON (le texte du SMS peut être dans `message`, `sms`, `body`, `text` ou `content`) :
-```json
-{ "message": "Ou resevwa 500 HTG de 509 3700 0000. Transaction ID: ABC123456", "from": "NatCash" }
-```
-Champs optionnels : `from`, `sender`, `number`. Un corps `text/plain` est aussi accepté (le corps entier est le SMS).
-
-Succès (HTTP 200) :
-```json
-{ "ok": true, "status": "credited", "topup_id": "...", "amount": 500, "provider_reference": "ABC123456" }
-```
-
-| HTTP | `error` | Cas |
-|---|---|---|
-| 401 | `unauthorized` | Secret absent ou incorrect |
-| 400 | `missing_message` | Aucun texte de SMS |
-| 422 | `amount_not_found` | Montant introuvable |
-| 422 | `transaction_reference_not_found` | Référence introuvable |
-| 404 | `no_matching_pending_topup` | Aucun topup pending correspondant |
-| 409 | `transaction_already_processed` | Référence déjà utilisée |
-| 409 | `ambiguous_topup` | Plusieurs topups possibles, aucun crédit |
-| 500 | `internal_error` | Erreur serveur (détails dans les logs uniquement) |
-
-Si la RPC signale une opération idempotente déjà payée, la réponse est `200` avec `status: "already_credited"` (aucun double crédit).
-
-## Logique de traitement
-
-1. Authentification du secret (comparaison en temps constant, `crypto.timingSafeEqual`), **avant** de lire le corps.
-2. Extraction du montant (HTG, G, gourdes ; les montants de solde/frais sont ignorés), de la référence (transaction / code / ref / transcode, normalisée en majuscules) et du numéro du sender si présent.
-3. Anti-doublon : si `provider_reference` existe déjà pour `provider = natcash` → 409.
-4. Recherche des `wallet_topups` : `provider = natcash`, `status = pending`, `currency = HTG`, **montant exact**, `created_at` dans la fenêtre `NATCASH_WINDOW_MINUTES`.
-5. Plusieurs candidats : le numéro du sender (comparaison normalisée sur les 8 derniers chiffres) sert à départager. S'il ne permet pas d'en isoler exactement un → `ambiguous_topup`, **aucun crédit**. Le numéro ne suffit jamais seul.
-6. Crédit via `POST /rest/v1/rpc/credit_wallet_topup`.
-
-## Rôle de `credit_wallet_topup`
-
-Fonction PostgreSQL existante (`SECURITY DEFINER`, réservée au `service_role`). Elle verrouille le topup et le customer, vérifie le statut `pending` et que le customer est actif, incrémente `wallet_balance`, crée la transaction `credit`, passe le topup à `paid` et enregistre `provider_reference`, `raw_response` et `paid_at`, de façon atomique et idempotente. Le backend **ne modifie jamais** `wallet_balance` directement.
-
-## Configuration SMS Forwarder
-
-- URL : `https://<votre-service>.onrender.com/sms`
-- Méthode : `POST`
-- Header : `x-sms-forwarder-secret: <votre secret>`
-- Content-Type : `application/json`
-- Corps :
-```json
-{ "from": "%from%", "message": "%body%" }
-```
-(les noms des variables `%from%` / `%body%` dépendent de l'application utilisée ; adaptez-les à sa documentation). Filtrez pour ne transférer que les SMS NatCash.
-
-## Sécurité
-
-- Aucun secret dans le code ; tout vient de `process.env`.
-- La clé service role n'est utilisée que côté serveur et n'est jamais loguée ni renvoyée.
-- Limite de corps : 256 kb. CORS fermé par défaut (webhook serveur-à-serveur).
-- Aucune stack trace envoyée au client.
-- Ne jamais commiter `.env`.
-
-## Déploiement Render
-
-1. Pousser ce dossier sur GitHub.
-2. Render → New → **Web Service** → choisir le dépôt.
-3. Runtime : Node. **Build Command** : `npm install`. **Start Command** : `npm start`.
-4. Ajouter les variables d'environnement ci-dessus.
-5. Vérifier `GET https://<service>.onrender.com/health`.
-
-Note : sur l'offre gratuite, Render met le service en veille ; le premier SMS peut être retardé. Pour un webhook de paiement, préférez une offre qui ne s'endort pas.
+Run:
+npm start
+Pou development:
+npm run dev
+5. Health Check
+Backend lan gen endpoint:
+GET /health
+URL Render:
+https://juvens-natcash-backend-qj2o.onrender.com/health
+Li dwe retounen yon repons ki montre backend lan ap fonksyone.
+6. SMS Endpoint
+SMS Forwarder dwe voye SMS NatCash yo sou:
+POST /sms
+URL Render:
+https://juvens-natcash-backend-qj2o.onrender.com/sms
+Header obligatwa:
+x-sms-forwarder-secret: YOUR_SMS_FORWARDER_SECRET
+YOUR_SMS_FORWARDER_SECRET dwe menm valeur ak:
+SMS_FORWARDER_SECRET
+nan Render.
+7. SMS Forwarder
+Aplikasyon itilize:
+SMS Forwarder — Kale-Studio
+SMS Forwarder dwe:
+resevwa SMS NatCash
+fè yon HTTPS POST
+voye request lan sou /sms
+voye secret la nan header la
+voye SMS la nan body request lan
+Backend lan ka li mesaj la nan youn nan fields sa yo:
+message
+sms
+body
+text
+content
+Pou nimewo moun ki voye SMS la, backend lan ka li:
+from
+sender
+number
+Important
+Non variables egzak SMS Forwarder itilize nan Body la depann de vèsyon aplikasyon an ak configuration li.
+Se poutèt sa, pa mete yon placeholder tankou:
+%from%
+%body%
+san verifye ke se egzak syntax aplikasyon an itilize.
+Nou dwe itilize syntax/dynamic variables aplikasyon SMS Forwarder la sipòte aktyèlman.
+8. NatCash Verification
+Backend lan verifye:
+SMS la gen yon montant.
+Transaction reference la egziste.
+Gen yon wallet_topup pending ki koresponn.
+Montant lan egzak.
+Transaction reference la poko itilize.
+Si sender disponib, li verifye ak nimewo kliyan an.
+Peman an fèt nan yon fenèt tan ki defini.
+Default:
+NATCASH_WINDOW_MINUTES=120
+9. Supabase Wallet
+Backend lan pa modifye wallet_balance dirèkteman.
+Li itilize RPC Supabase:
+credit_wallet_topup
+RPC sa a fè credit wallet lan atomikman.
+Li:
+verifye wallet_topup
+lock wallet topup la
+lock customer la
+ajoute lajan nan wallet
+kreye transaction credit la
+mete wallet_topup kòm paid
+evite double credit
+10. Idempotency
+Si menm SMS / transaction reference lan rive plizyè fwa, backend lan pa dwe kredite wallet lan plizyè fwa.
+Transaction reference la dwe inik.
+Si peman an deja trete, backend lan retounen yon repons idempotent olye li fè yon lòt credit.
+11. Security
+Backend lan itilize:
+Supabase Service Role Key sèlman sou server
+SMS Forwarder secret
+timing-safe secret comparison
+Supabase RPC
+RLS sou Supabase
+validation sou amount
+validation sou transaction reference
+validation sou customer
+duplicate protection
+request size limit
+CORS allowlist
+Pa janm mete:
+SUPABASE_SERVICE_ROLE_KEY
+nan frontend.
+Pa janm mete secret SMS Forwarder la nan frontend.
+12. Render Deployment
+Sou Render:
+Build Command
+npm install
+Start Command
+npm start
+Environment Variables
+Ajoute:
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
+SMS_FORWARDER_SECRET
+NATCASH_WINDOW_MINUTES
+Opsyonèl:
+PORT
+CUSTOMER_PHONE_COLUMN
+CORS_ORIGINS
+Pa mete secret values yo nan GitHub.
+13. Production Flow
+Client
+  ↓
+Recharger mon compte
+  ↓
+Create wallet_topup
+  ↓
+wallet_topup = pending
+  ↓
+Client peye NatCash
+  ↓
+NatCash SMS
+  ↓
+SMS Forwarder
+  ↓
+POST /sms
+  ↓
+NatCash Backend
+  ↓
+Verify payment
+  ↓
+Find pending wallet_topup
+  ↓
+credit_wallet_topup()
+  ↓
+wallet_balance + amount
+  ↓
+wallet_topup = paid
+Apre sa kliyan an ka itilize balance li pou achte pwodwi sou JuvensTopUp.
+14. Important: Manual Top-Up
+Backend NatCash sa a pa fè recharge Free Fire otomatik.
+Pou kounye a:
+Client
+  ↓
+Wallet recharge
+  ↓
+Wallet credited
+  ↓
+Client buys product
+  ↓
+Wallet debited
+  ↓
+Order = pending
+  ↓
+Admin Dashboard
+  ↓
+Admin recharge Free Fire manually
+  ↓
+Admin marks order as delivered
+Supplier API automation ap vini pita si sa nesesè.
+15. Repository
+GitHub:
+https://github.com/pierremanueljuvensley-jpg/juvens_natcash_backend
+Backend:
+juvens-natcash-backend
+Version:
+3.0.0
+16. Important Security Rules
+Pa janm commit:
+.env
+SUPABASE_SERVICE_ROLE_KEY
+SMS_FORWARDER_SECRET
+README.md dwe sèlman genyen instructions ak placeholders.
+Secrets reyèl yo dwe rete nan Render Environment Variables.
+17. Current Status
+Backend NatCash:
+✅ Node.js / Express
+✅ Supabase integration
+✅ Wallet top-up verification
+✅ NatCash SMS parsing
+✅ Duplicate protection
+✅ Atomic wallet credit
+✅ Security checks
+✅ Render ready
+✅ Manual Free Fire delivery
+Next step:
+Deploy backend sou Render
+        ↓
+Test /health
+        ↓
+Configure SMS Forwarder
+        ↓
+Test NatCash payment
