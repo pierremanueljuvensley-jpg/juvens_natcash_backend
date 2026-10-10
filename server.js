@@ -3,12 +3,10 @@
 /**
  * JuvensTopUp NatCash Backend v3
  *
- * NatCash SMS -> parsing -> wallet_topups (Supabase)
- * -> RPC credit_wallet_topup -> wallet credited.
+ * NatCash SMS -> Supabase wallet_topups
+ * -> credit_wallet_topup -> wallet credited.
  *
- * Supabase est la source de verite.
- * Aucun stockage local.
- * Tous les secrets viennent de process.env.
+ * All secrets are loaded from process.env.
  */
 
 const crypto = require('crypto');
@@ -18,9 +16,7 @@ const SERVICE = 'juvens-natcash-backend';
 const SUPABASE_TIMEOUT_MS = 10000;
 const PHONE_SUFFIX_LEN = 8;
 
-/* ------------------------------------------------------------------ */
-/* Configuration                                                       */
-/* ------------------------------------------------------------------ */
+/* Configuration */
 
 function loadConfig(env = process.env) {
   const missing = [
@@ -40,7 +36,7 @@ function loadConfig(env = process.env) {
     : 120;
 
   if (!Number.isFinite(windowMinutes) || windowMinutes <= 0) {
-    throw new Error('NATCASH_WINDOW_MINUTES must be a positive number');
+    throw new Error('NATCASH_WINDOW_MINUTES must be positive');
   }
 
   const phoneColumn = (env.CUSTOMER_PHONE_COLUMN || 'phone').trim();
@@ -63,9 +59,7 @@ function loadConfig(env = process.env) {
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* Logs                                                                */
-/* ------------------------------------------------------------------ */
+/* Logging */
 
 function log(level, event, data) {
   const line = {
@@ -80,9 +74,7 @@ function log(level, event, data) {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Securite                                                            */
-/* ------------------------------------------------------------------ */
+/* Security */
 
 function secretsMatch(provided, expected) {
   if (
@@ -99,9 +91,7 @@ function secretsMatch(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-/* ------------------------------------------------------------------ */
-/* Parsing du SMS NatCash                                              */
-/* ------------------------------------------------------------------ */
+/* NatCash SMS parsing */
 
 const CURRENCY = '(?:HTG|GDES?|GOURDES?|G)';
 
@@ -271,9 +261,7 @@ function extractMessage(body) {
   return '';
 }
 
-/* ------------------------------------------------------------------ */
-/* Client Supabase REST                                                */
-/* ------------------------------------------------------------------ */
+/* Supabase REST client */
 
 class SupabaseError extends Error {
   constructor(status, body) {
@@ -314,7 +302,6 @@ function createSupabase(config) {
       });
 
       const text = await res.text();
-
       let data = null;
 
       if (text) {
@@ -336,10 +323,6 @@ function createSupabase(config) {
   }
 
   return {
-    /*
-     * NOUVEAU : verification non destructive de Supabase.
-     * Effectue une lecture minimale, sans modifier de donnees.
-     */
     async healthCheck() {
       return request('GET', '/rest/v1/wallet_topups', {
         query: {
@@ -349,62 +332,47 @@ function createSupabase(config) {
       });
     },
 
-    // Reference NatCash deja utilisee ?
     async findTopupByReference(reference) {
-      const rows = await request(
-        'GET',
-        '/rest/v1/wallet_topups',
-        {
-          query: {
-            select: 'id,status',
-            provider: 'eq.natcash',
-            provider_reference: 'eq.' + reference,
-            limit: '1',
-          },
-        }
-      );
+      const rows = await request('GET', '/rest/v1/wallet_topups', {
+        query: {
+          select: 'id,status',
+          provider: 'eq.natcash',
+          provider_reference: 'eq.' + reference,
+          limit: '1',
+        },
+      });
 
       return Array.isArray(rows) && rows.length ? rows[0] : null;
     },
 
-    // Recharges NatCash en attente, en HTG, dans la fenetre temporelle.
     async findPendingTopups(amount, sinceIso) {
-      const rows = await request(
-        'GET',
-        '/rest/v1/wallet_topups',
-        {
-          query: {
-            select: 'id,customer_id,amount,created_at',
-            provider: 'eq.natcash',
-            status: 'eq.pending',
-            currency: 'eq.HTG',
-            amount: 'eq.' + amount.toFixed(2),
-            created_at: 'gte.' + sinceIso,
-            order: 'created_at.asc',
-            limit: '50',
-          },
-        }
-      );
+      const rows = await request('GET', '/rest/v1/wallet_topups', {
+        query: {
+          select: 'id,customer_id,amount,created_at',
+          provider: 'eq.natcash',
+          status: 'eq.pending',
+          currency: 'eq.HTG',
+          amount: 'eq.' + amount.toFixed(2),
+          created_at: 'gte.' + sinceIso,
+          order: 'created_at.asc',
+          limit: '50',
+        },
+      });
 
       return Array.isArray(rows) ? rows : [];
     },
 
-    // Telephones des clients candidats (lecture seule).
     async findCustomerPhones(customerIds) {
       const map = new Map();
 
       if (!customerIds.length) return map;
 
-      const rows = await request(
-        'GET',
-        '/rest/v1/customers',
-        {
-          query: {
-            select: 'id,' + config.phoneColumn,
-            id: 'in.(' + customerIds.join(',') + ')',
-          },
-        }
-      );
+      const rows = await request('GET', '/rest/v1/customers', {
+        query: {
+          select: 'id,' + config.phoneColumn,
+          id: 'in.(' + customerIds.join(',') + ')',
+        },
+      });
 
       for (const r of Array.isArray(rows) ? rows : []) {
         map.set(r.id, r[config.phoneColumn] || null);
@@ -413,19 +381,14 @@ function createSupabase(config) {
       return map;
     },
 
-    // Credit atomique et idempotent via PostgreSQL.
     async creditWalletTopup(topupId, reference, rawResponse) {
-      return request(
-        'POST',
-        '/rest/v1/rpc/credit_wallet_topup',
-        {
-          body: {
-            p_topup_id: topupId,
-            p_provider_reference: reference,
-            p_raw_response: rawResponse,
-          },
-        }
-      );
+      return request('POST', '/rest/v1/rpc/credit_wallet_topup', {
+        body: {
+          p_topup_id: topupId,
+          p_provider_reference: reference,
+          p_raw_response: rawResponse,
+        },
+      });
     },
   };
 }
@@ -445,9 +408,7 @@ function isAlreadyPaidResult(result) {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Handler principal : traitement d'un SMS                             */
-/* ------------------------------------------------------------------ */
+/* SMS handler */
 
 function reply(res, status, payload) {
   return res.status(status).json(payload);
@@ -482,7 +443,7 @@ function createSmsHandler(config, supabase) {
         });
       }
 
-      // Anti-doublon.
+      // Prevent reuse of a previously recorded NatCash reference.
       const existing = await supabase.findTopupByReference(reference);
 
       if (existing) {
@@ -498,10 +459,7 @@ function createSmsHandler(config, supabase) {
         Date.now() - config.windowMinutes * 60 * 1000
       ).toISOString();
 
-      let candidates = await supabase.findPendingTopups(
-        amount,
-        sinceIso
-      );
+      let candidates = await supabase.findPendingTopups(amount, sinceIso);
 
       if (candidates.length === 0) {
         log('info', 'sms_no_match', { reference, amount });
@@ -512,41 +470,51 @@ function createSmsHandler(config, supabase) {
         });
       }
 
-      // Plusieurs candidats : le numero du sender sert a departager.
-      if (candidates.length > 1) {
-        if (!sender) {
-          log('warn', 'sms_ambiguous_no_sender', {
-            reference,
-            amount,
-            candidates: candidates.length,
-          });
+      // Always require and verify the sender number, even for one candidate.
+      if (!sender) {
+        log('warn', 'sms_sender_not_found', {
+          reference,
+          amount,
+          candidates: candidates.length,
+        });
 
-          return reply(res, 409, {
-            ok: false,
-            error: 'ambiguous_topup',
-          });
-        }
+        return reply(res, 422, {
+          ok: false,
+          error: 'sender_number_not_found',
+        });
+      }
 
-        let phones;
+      let phones;
 
-        try {
-          phones = await supabase.findCustomerPhones([
-            ...new Set(candidates.map((c) => c.customer_id)),
-          ]);
-        } catch (err) {
-          log('warn', 'customer_phone_lookup_failed', {
-            status: err.status,
-          });
+      try {
+        phones = await supabase.findCustomerPhones([
+          ...new Set(candidates.map((c) => c.customer_id)),
+        ]);
+      } catch (err) {
+        log('warn', 'customer_phone_lookup_failed', {
+          status: err.status,
+        });
 
-          return reply(res, 409, {
-            ok: false,
-            error: 'ambiguous_topup',
-          });
-        }
+        return reply(res, 503, {
+          ok: false,
+          error: 'customer_phone_verification_unavailable',
+        });
+      }
 
-        candidates = candidates.filter((c) =>
-          samePhone(sender, phones.get(c.customer_id))
-        );
+      candidates = candidates.filter((c) =>
+        samePhone(sender, phones.get(c.customer_id))
+      );
+
+      if (candidates.length === 0) {
+        log('warn', 'sms_sender_phone_mismatch', {
+          reference,
+          amount,
+        });
+
+        return reply(res, 403, {
+          ok: false,
+          error: 'sender_phone_mismatch',
+        });
       }
 
       if (candidates.length !== 1) {
@@ -644,6 +612,8 @@ function createSmsHandler(config, supabase) {
   };
 }
 
+/* Authentication middleware */
+
 function createAuthMiddleware(config) {
   return function authMiddleware(req, res, next) {
     const provided = req.get('x-sms-forwarder-secret');
@@ -667,9 +637,7 @@ function healthHandler(req, res) {
   });
 }
 
-/* ------------------------------------------------------------------ */
-/* Application Express                                                 */
-/* ------------------------------------------------------------------ */
+/* Express application */
 
 function createApp(config, supabase = createSupabase(config)) {
   const express = require('express');
@@ -677,17 +645,14 @@ function createApp(config, supabase = createSupabase(config)) {
 
   app.disable('x-powered-by');
 
-  // CORS ferme par defaut.
+  // CORS is closed by default.
   app.use((req, res, next) => {
     const origin = req.get('origin');
 
     if (origin && config.corsOrigins.includes(origin)) {
       res.set('Access-Control-Allow-Origin', origin);
       res.set('Vary', 'Origin');
-      res.set(
-        'Access-Control-Allow-Methods',
-        'GET,POST,OPTIONS'
-      );
+      res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
       res.set(
         'Access-Control-Allow-Headers',
         'Content-Type,x-sms-forwarder-secret'
@@ -701,10 +666,6 @@ function createApp(config, supabase = createSupabase(config)) {
 
   app.get('/health', healthHandler);
 
-  /*
-   * NOUVELLE ROUTE :
-   * verifie l'acces a Supabase sans modifier de donnees.
-   */
   app.get('/health/supabase', async (req, res) => {
     try {
       await supabase.healthCheck();
@@ -727,7 +688,7 @@ function createApp(config, supabase = createSupabase(config)) {
     }
   });
 
-  // Auth AVANT le parsing du body.
+  // Authenticate before parsing the request body.
   app.post(
     '/sms',
     createAuthMiddleware(config),
@@ -779,9 +740,7 @@ function createApp(config, supabase = createSupabase(config)) {
   return app;
 }
 
-/* ------------------------------------------------------------------ */
-/* Demarrage                                                           */
-/* ------------------------------------------------------------------ */
+/* Startup */
 
 function start() {
   let config;
