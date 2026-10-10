@@ -1,3 +1,4 @@
+JavaScript
 'use strict';
 
 /**
@@ -594,3 +595,236 @@ function createSmsHandler(config, supabase) {
           return reply(res, 409, {
             ok: false,
             error: 'transaction_already_processed',
+          });
+        }
+
+        throw err;
+      }
+
+      if (isAlreadyPaidResult(result)) {
+        log('info', 'sms_already_credited', {
+          reference,
+          topup_id: topup.id,
+        });
+
+        return reply(res, 200, {
+          ok: true,
+          status: 'already_credited',
+          topup_id: topup.id,
+          amount,
+          provider_reference: reference,
+        });
+      }
+
+      log('info', 'sms_credited', {
+        reference,
+        topup_id: topup.id,
+        amount,
+      });
+
+      return reply(res, 200, {
+        ok: true,
+        status: 'credited',
+        topup_id: topup.id,
+        amount,
+        provider_reference: reference,
+      });
+    } catch (err) {
+      log('error', 'sms_internal_error', {
+        name: err && err.name,
+        message: err && err.message,
+        supabase_status: err && err.status,
+        supabase_body: err && err.body,
+      });
+
+      return reply(res, 500, {
+        ok: false,
+        error: 'internal_error',
+      });
+    }
+  };
+}
+
+function createAuthMiddleware(config) {
+  return function authMiddleware(req, res, next) {
+    const provided = req.get('x-sms-forwarder-secret');
+
+    if (!secretsMatch(provided, config.forwarderSecret)) {
+      return reply(res, 401, {
+        ok: false,
+        error: 'unauthorized',
+      });
+    }
+
+    return next();
+  };
+}
+
+function healthHandler(req, res) {
+  return reply(res, 200, {
+    ok: true,
+    service: SERVICE,
+    version: VERSION,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Application Express                                                 */
+/* ------------------------------------------------------------------ */
+
+function createApp(config, supabase = createSupabase(config)) {
+  const express = require('express');
+  const app = express();
+
+  app.disable('x-powered-by');
+
+  // CORS ferme par defaut.
+  app.use((req, res, next) => {
+    const origin = req.get('origin');
+
+    if (origin && config.corsOrigins.includes(origin)) {
+      res.set('Access-Control-Allow-Origin', origin);
+      res.set('Vary', 'Origin');
+      res.set(
+        'Access-Control-Allow-Methods',
+        'GET,POST,OPTIONS'
+      );
+      res.set(
+        'Access-Control-Allow-Headers',
+        'Content-Type,x-sms-forwarder-secret'
+      );
+    }
+
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+    return next();
+  });
+
+  app.get('/health', healthHandler);
+
+  /*
+   * NOUVELLE ROUTE :
+   * verifie l'acces a Supabase sans modifier de donnees.
+   */
+  app.get('/health/supabase', async (req, res) => {
+    try {
+      await supabase.healthCheck();
+
+      return res.status(200).json({
+        ok: true,
+        service: SERVICE,
+        supabase: 'connected',
+      });
+    } catch (err) {
+      log('error', 'supabase_health_check_failed', {
+        status: err.status || null,
+        message: err.message,
+      });
+
+      return res.status(503).json({
+        ok: false,
+        error: 'supabase_unavailable',
+      });
+    }
+  });
+
+  // Auth AVANT le parsing du body.
+  app.post(
+    '/sms',
+    createAuthMiddleware(config),
+    express.json({ limit: '256kb' }),
+    express.urlencoded({
+      extended: false,
+      limit: '256kb',
+    }),
+    express.text({
+      type: 'text/plain',
+      limit: '256kb',
+    }),
+    createSmsHandler(config, supabase)
+  );
+
+  app.use((req, res) =>
+    reply(res, 404, {
+      ok: false,
+      error: 'not_found',
+    })
+  );
+
+  app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.too.large') {
+      return reply(res, 413, {
+        ok: false,
+        error: 'payload_too_large',
+      });
+    }
+
+    if (err && err.type === 'entity.parse.failed') {
+      return reply(res, 400, {
+        ok: false,
+        error: 'invalid_json',
+      });
+    }
+
+    log('error', 'unhandled_error', {
+      name: err && err.name,
+      message: err && err.message,
+    });
+
+    return reply(res, 500, {
+      ok: false,
+      error: 'internal_error',
+    });
+  });
+
+  return app;
+}
+
+/* ------------------------------------------------------------------ */
+/* Demarrage                                                           */
+/* ------------------------------------------------------------------ */
+
+function start() {
+  let config;
+
+  try {
+    config = loadConfig();
+  } catch (err) {
+    console.error('[startup] ' + err.message);
+    process.exit(1);
+  }
+
+  const app = createApp(config);
+
+  const server = app.listen(config.port, () => {
+    log('info', 'server_started', {
+      service: SERVICE,
+      version: VERSION,
+      port: config.port,
+    });
+  });
+
+  const shutdown = () =>
+    server.close(() => process.exit(0));
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+if (require.main === module) start();
+
+module.exports = {
+  VERSION,
+  loadConfig,
+  secretsMatch,
+  parseNumber,
+  parseNatcashSms,
+  extractMessage,
+  samePhone,
+  isAlreadyPaidResult,
+  createSupabase,
+  createSmsHandler,
+  createAuthMiddleware,
+  healthHandler,
+  createApp,
+};
